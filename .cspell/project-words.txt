@@ -1,0 +1,15 @@
+
+airdress
+airdresses
+autoPatchelfHook
+dont
+fetchurl
+flake
+minisig
+minisign
+nixos
+NixOS
+nixpkgs
+pkgs
+pname
+stdenv
