@@ -11,5 +11,7 @@ nixos
 NixOS
 nixpkgs
 pkgs
+pkill
 pname
+prek
 stdenv
