@@ -13,7 +13,8 @@
   "flagWords": [],
   "ignorePaths": [
     ".git/",
-    "flake.lock"
+    "flake.lock",
+    "LICENSE"
   ],
   "ignoreRegExpList": [
     "/[A-Za-z0-9+/]{16,}={0,2}/",
