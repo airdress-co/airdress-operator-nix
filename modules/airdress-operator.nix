@@ -49,6 +49,17 @@ in
   options.services.airdress-operator = {
     enable = lib.mkEnableOption "airdress-operator relay and routing daemon";
 
+    contentKeyFile = lib.mkOption {
+      type        = lib.types.str;
+      default     = "/etc/credstore.encrypted/airdress-content-key";
+      description = ''
+        Path to the systemd-encrypted content key credential (SPEC-035).
+        The file must be created with:
+        <literal>dd if=/dev/urandom bs=32 count=1 | systemd-creds encrypt --name=content_key - /etc/credstore.encrypted/airdress-content-key</literal>
+        The operator reads it at startup via <literal>$CREDENTIALS_DIRECTORY/content_key</literal>.
+      '';
+    };
+
     package = lib.mkOption {
       type        = lib.types.package;
       description = ''
@@ -168,6 +179,10 @@ in
         StateDirectoryMode    = "0750";
 
         ReadWritePaths = secretsReadWritePaths;
+
+        # SPEC-035: deliver the 32-byte content key via systemd credential
+        # store so it never touches the Nix store or environment variables.
+        LoadCredentialEncrypted = "content_key:${cfg.contentKeyFile}";
       };
     };
   };
