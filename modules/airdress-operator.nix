@@ -28,7 +28,14 @@ let
       homing_operator  = cfg.homing;
       compute = {
         pool_member_name             = cfg.compute.poolMemberName;
-        enrollment_token_file        = cfg.compute.bootstrapTokenFile;
+        # The path the *service* reads, not the path the operator
+        # (person) writes. systemd copies bootstrapTokenFile into the
+        # unit's credentials directory below via LoadCredential=;
+        # pointing the config at the source instead would have the
+        # operator open a root-owned 0400 file as a DynamicUser, which
+        # it cannot read — while a perfectly readable copy sits
+        # unused two directories away.
+        enrollment_token_file        = "/run/credentials/airdress-operator.service/enrollment_token";
         transport_preference         = cfg.compute.transportPreference;
         wg_handshake_timeout_seconds = cfg.compute.wgHandshakeTimeoutSeconds;
         vllm_local_url               = cfg.compute.vllmLocalUrl;
