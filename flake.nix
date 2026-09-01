@@ -55,20 +55,20 @@
   outputs = { self, nixpkgs }:
     let
       # --- version-pinned block (updated by airdress-bot on each release) ---
-      version = "v0.1.9";
+      version = "v0.1.11";
 
       artifacts = {
         "x86_64-linux" = {
           platform = "linux-amd64";
-          hash     = "sha256-qfiBLWRArl4m4Y7fqLBQVOKqYtjyOZX0/c5Bus7nfGw=";
+          hash     = "sha256-0Ytwm/ywPkt2GuPFwmkrNO68yLF/okUbE/0xTlt+Q2c=";
         };
         "aarch64-linux" = {
           platform = "linux-arm64";
-          hash     = "sha256-8ceqvTDx7RbiVQUftQaSEHqM8KNcXe3RNUbYkuVv9CU=";
+          hash     = "sha256-CTK18cd91Fm/tW0/2K3hBq6pJFyKdA+77l+NmaPngII=";
         };
         "aarch64-darwin" = {
           platform = "darwin-arm64";
-          hash     = "sha256-Kx9VcGrpc0CNU+wfWAQlBvNNnAa9c489TG9AwX1vMG8=";
+          hash     = "sha256-pEHo9G4H+6EPrHpWQYDEYX/tDnDMPWihhwUTBq8H5AY=";
         };
       };
       # --- end version-pinned block ---
