@@ -45,16 +45,31 @@ let
       pg  = cfg.postgresPackage;
       ver = cfg.postgresVersion;
     in
+    # Two layouts, deliberately: postgresql_embedded looks for
+    # <installdir>/<version>/bin/postgres, while the operator launches
+    # <installdir>/bin/postgres directly. Both must be complete.
+    #
+    # postgres resolves its lib and share directories RELATIVE TO ITS OWN
+    # BINARY, so a bin/ without sibling lib/ is not a partial convenience
+    # — it is a postmaster that cannot start:
+    #
+    #   FATAL: could not open directory ".../airdress-pg-install-18.3.0/lib"
+    #   HINT:  This may indicate an incomplete PostgreSQL installation
+    #
+    # The top level had bin/ only, so whichever layout the operator picked
+    # decided whether it booted. Mirror all three in both places.
     pkgs.runCommand "airdress-pg-install-${ver}" { } ''
-      mkdir -p $out/${ver}/bin $out/${ver}/lib $out/bin
+      mkdir -p $out/${ver}/bin $out/${ver}/lib $out/bin $out/lib
       for bin in ${pg}/bin/*; do
         ln -s "$bin" $out/${ver}/bin/
         ln -s "$bin" $out/bin/
       done
       for lib in ${pg}/lib/*; do
         ln -s "$lib" $out/${ver}/lib/
+        ln -s "$lib" $out/lib/
       done
       ln -s ${pg}/share $out/${ver}/share
+      ln -s ${pg}/share $out/share
     '';
 
   format     = pkgs.formats.toml { };
