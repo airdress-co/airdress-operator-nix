@@ -38,6 +38,41 @@
 #   services.airdress-operator.settings        attrs    — operator TOML config as Nix attrs
 #   services.airdress-operator.secretsFile     path     — TOML secrets fragment (sops/agenix)
 #   services.airdress-operator.logLevel        string   — AIRDRESS_LOG directive (default: "info")
+#   services.airdress-operator.instances       attrs    — named instances, see below
+#
+# ## Several operators on one host
+#
+# A machine can be an inference pool member AND a place where a hosted
+# operator runs containers. Those are different trust postures, so they
+# are different processes rather than one process with a wider role
+# (RDR-035 §5.8):
+#
+#   services.airdress-operator.instances = {
+#     compute = {
+#       enable = true;
+#       role   = "compute";
+#       homing = "https://ipv6-operator.alice.airdr.es";
+#       compute.poolMemberName = "ai-nas-0-compute";
+#       settings.bind              = "127.0.0.1:8080";
+#       settings.database.data_dir = "/var/lib/airdress-operator-compute/postgres";
+#     };
+#     apps = {
+#       enable = true;
+#       settings.bind              = "127.0.0.1:8081";
+#       settings.database.data_dir = "/var/lib/airdress-operator-apps/postgres";
+#       settings.apps.backends.container.binary = "docker";
+#     };
+#   };
+#
+# Each instance gets its own unit, DynamicUser, state directory and
+# credentials, so one cannot read another's. Every option above is
+# available per instance. The single-instance surface still works and is
+# the instance named "default", which keeps the original unit and state
+# directory names — an existing host sees no rename.
+#
+# The module asserts at eval time that instances do not collide on bind
+# address, PostgreSQL data directory, healthz bind, pool member name or
+# TUN interface name. It cannot assert that they fit in the host's RAM.
 #
 # The module handles DynamicUser hardening, CAP_NET_BIND_SERVICE for DNS port 53,
 # and builds a pgInstallDir derivation in the Nix store so embedded PostgreSQL
