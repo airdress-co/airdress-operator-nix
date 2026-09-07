@@ -13,21 +13,55 @@
 #
 # Once SPEC-037 lands (postgresql_embedded ≥ 0.20 + trust_installation_dir),
 # the root-level aliases become redundant but harmless.
+#
+# ── Multiple instances on one host (RDR-035 §5.8) ──────────────────────
+#
+# One machine can be both an inference pool member and a place where a
+# hosted operator runs containers. Those are different trust postures —
+# a container-runtime grant is root-equivalent, talking to a vLLM the
+# user already runs is not — so they are separate operator processes
+# with separate users, units, credentials and enrollments, rather than
+# one process carrying a wider role.
+#
+#   services.airdress-operator.instances = {
+#     compute = { enable = true; role = "compute"; ... };
+#     apps    = { enable = true; settings.bind = "127.0.0.1:8081"; ... };
+#   };
+#
+# The single-instance surface (services.airdress-operator.enable and the
+# options beside it) still works unchanged: it is defined as the instance
+# named "default", whose unit and state directory keep their original
+# names, so an existing host sees no rename and does not lose its
+# PostgreSQL data directory.
+#
+# What two instances do NOT separate is capacity. RAM, CPU and GPU are
+# host facts, and one instance's workload can spike into headroom the
+# other was counting on. This module asserts that instances do not
+# collide on ports, data directories or interface names; it cannot
+# assert that they fit.
 { config, lib, pkgs, ... }:
 
 let
   cfg = config.services.airdress-operator;
 
+  # Instances are keyed by arbitrary names. "default" keeps the original
+  # unit and state-directory names so the single-instance surface is a
+  # pure alias; any other name is suffixed.
+  unitNameFor = name:
+    if name == "default" then "airdress-operator" else "airdress-operator-${name}";
+
+  stateDirFor = unitNameFor;
+
   # SPEC-038 — when role is "compute", the operator runs a stripped
   # subsystem set (enrollment + WG + long-poll + vLLM dispatch). The
   # generated TOML gets a `[role]` block driven by the typed options
   # below; users can still override via `settings.role.*` directly.
-  computeSettings = lib.optionalAttrs (cfg.role == "compute") {
+  computeSettingsFor = name: icfg: lib.optionalAttrs (icfg.role == "compute") {
     role = {
       mode             = "compute";
-      homing_operator  = cfg.homing;
+      homing_operator  = icfg.homing;
       compute = {
-        pool_member_name             = cfg.compute.poolMemberName;
+        pool_member_name             = icfg.compute.poolMemberName;
         # The path the *service* reads, not the path the operator
         # (person) writes. systemd copies bootstrapTokenFile into the
         # unit's credentials directory below via LoadCredential=;
@@ -35,23 +69,23 @@ let
         # operator open a root-owned 0400 file as a DynamicUser, which
         # it cannot read — while a perfectly readable copy sits
         # unused two directories away.
-        enrollment_token_file        = "/run/credentials/airdress-operator.service/enrollment_token";
-        transport_preference         = cfg.compute.transportPreference;
-        wg_handshake_timeout_seconds = cfg.compute.wgHandshakeTimeoutSeconds;
-        vllm_local_url               = cfg.compute.vllmLocalUrl;
-        auth_secret_ref              = cfg.compute.authSecretRef;
-        healthz_bind                 = cfg.compute.healthzBind;
-        tun_name                     = cfg.compute.tunName;
-        tun_mtu                      = cfg.compute.tunMtu;
+        #
+        # Per instance: the credentials directory is named after the unit,
+        # so a second instance reads a different path.
+        enrollment_token_file        =
+          "/run/credentials/${unitNameFor name}.service/enrollment_token";
+        transport_preference         = icfg.compute.transportPreference;
+        wg_handshake_timeout_seconds = icfg.compute.wgHandshakeTimeoutSeconds;
+        vllm_local_url               = icfg.compute.vllmLocalUrl;
+        auth_secret_ref              = icfg.compute.authSecretRef;
+        healthz_bind                 = icfg.compute.healthzBind;
+        tun_name                     = icfg.compute.tunName;
+        tun_mtu                      = icfg.compute.tunMtu;
       };
     };
   };
 
-  pgInstallDir =
-    let
-      pg  = cfg.postgresPackage;
-      ver = cfg.postgresVersion;
-    in
+  mkPgInstallDir = pg: ver:
     # Two layouts, deliberately: postgresql_embedded looks for
     # <installdir>/<version>/bin/postgres, while the operator launches
     # <installdir>/bin/postgres directly. Both must be complete.
@@ -79,20 +113,52 @@ let
       ln -s ${pg}/share $out/share
     '';
 
-  format     = pkgs.formats.toml { };
-  mergedSettings = lib.recursiveUpdate computeSettings cfg.settings;
-  configFile = format.generate "airdress-operator.toml" mergedSettings;
+  format = pkgs.formats.toml { };
 
-  secretsEnv = lib.optional (cfg.secretsFile != null)
-    "AIRDRESS_SECRETS_FILE=${cfg.secretsFile}";
+  configFileFor = name: icfg:
+    format.generate "${unitNameFor name}.toml"
+      (lib.recursiveUpdate (computeSettingsFor name icfg) icfg.settings);
 
-  secretsReadWritePaths = lib.optional (cfg.secretsFile != null)
-    (builtins.dirOf (toString cfg.secretsFile));
+  enabledInstances = lib.filterAttrs (_: i: i.enable) cfg.instances;
 
-in
-{
-  options.services.airdress-operator = {
-    enable = lib.mkEnableOption "airdress-operator relay and routing daemon";
+  # ── Collision detection ────────────────────────────────────────────
+  #
+  # Two operator processes on one host share every singleton the config
+  # names. Catching a duplicate at eval time is the whole reason this is
+  # a Nix module rather than a pair of hand-written units: a duplicated
+  # bind address is a unit that restarts forever, and a duplicated
+  # PostgreSQL data directory is two postmasters fighting over one
+  # cluster, which is worse than a crash.
+  #
+  # `get` returning null or "" means "not set", which is never a
+  # collision.
+  collisionsOn = get:
+    let
+      values = lib.filter (v: v != null && v != "")
+        (lib.mapAttrsToList (_: get) enabledInstances);
+    in
+    lib.filter (v: lib.count (x: x == v) values > 1) (lib.unique values);
+
+  mkCollisionAssertion = { label, option, get }:
+    let dupes = collisionsOn get;
+    in {
+      assertion = dupes == [ ];
+      message = ''
+        Two enabled airdress-operator instances share ${label}: ${
+          lib.concatStringsSep ", " (map toString dupes)
+        }. Set a distinct `${option}` on each instance — two operator
+        processes on one host cannot share it.
+      '';
+    };
+
+  # `settings` is free-form attrs, so reach into it defensively.
+  settingsPath = path: icfg: lib.attrByPath path null icfg.settings;
+
+  # Options that describe ONE operator process. Used twice: once at the
+  # top level (the single-instance surface) and once inside each entry of
+  # `instances`, so there is exactly one description of what an instance
+  # is.
+  instanceOptions = {
 
     contentKeyFile = lib.mkOption {
       type        = lib.types.str;
@@ -295,108 +361,246 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable (
-    let
-      isCompute       = cfg.role == "compute";
-      kernelTunActive = isCompute && cfg.compute.kernelTun;
-      caps =
-        [ "CAP_NET_BIND_SERVICE" ]
-        ++ lib.optional kernelTunActive "CAP_NET_ADMIN";
+in
+{
+  # The single-instance surface is the same option set as one entry of
+  # `instances`, plus the two options that only make sense at the top
+  # level.
+  options.services.airdress-operator = instanceOptions // {
+    enable = lib.mkEnableOption "airdress-operator relay and routing daemon";
 
-      # SPEC-044 FR-10 — clean up a stale TUN device left behind by a
-      # previous crashed instance before we try to create our own.
-      tunCleanupScript = pkgs.writeShellScript "airdress-tun-cleanup" ''
-        set -eu
-        if ${pkgs.iproute2}/bin/ip link show ${cfg.compute.tunName} 2>/dev/null; then
-            ${pkgs.systemd}/bin/systemd-cat -t airdress-operator \
-                echo "kernel-tun: cleaning up stale ${cfg.compute.tunName}"
-            ${pkgs.iproute2}/bin/ip link delete ${cfg.compute.tunName} || true
-        fi
-      '';
-
-      loadCredentials =
-        [ "content_key:${cfg.contentKeyFile}" ];
-      loadPlaintextCredentials =
-        lib.optional (isCompute && cfg.compute.bootstrapTokenFile != null)
-          "enrollment_token:${cfg.compute.bootstrapTokenFile}";
-
-      execStartPre =
-        lib.optional kernelTunActive (toString tunCleanupScript);
-    in
-    {
-      assertions = [
-        {
-          assertion = !isCompute || cfg.homing != null;
-          message   = "services.airdress-operator.homing must be set when role = \"compute\".";
-        }
-        {
-          assertion = !isCompute || cfg.compute.poolMemberName != "";
-          message   = "services.airdress-operator.compute.poolMemberName must be set when role = \"compute\".";
-        }
-      ];
-
-      systemd.services.airdress-operator = {
-        description = "Airdress Operator";
-        after       = [ "network-online.target" ];
-        wants       = [ "network-online.target" ];
-        wantedBy    = [ "multi-user.target" ];
-
-        serviceConfig = {
-          Type       = "simple";
-          ExecStart  = "${cfg.package}/bin/airdress-operator serve";
-          ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
-          Restart    = "on-failure";
-          RestartSec = "10s";
-          # initdb on first run can take a while; give it a generous budget.
-          TimeoutStartSec = "600";
-          TimeoutStopSec  = "30";
-
-          Environment = [
-            "AIRDRESS_CONFIG=${configFile}"
-            "AIRDRESS_LOG=${cfg.logLevel}"
-            # Point embedded-PG at the Nix store (exec-allowed) instead of the
-            # state directory (noexec under DynamicUser=yes).
-            "AIRDRESS_PG_INSTALLATION_DIR=${pgInstallDir}"
-          ] ++ secretsEnv;
-
-          # Allow binding privileged ports (DNS port 53) without root.
-          # SPEC-044: CAP_NET_ADMIN is added when role=compute + kernelTun=true.
-          AmbientCapabilities   = lib.concatStringsSep " " caps;
-          CapabilityBoundingSet = lib.concatStringsSep " " caps;
-
-          # SPEC-044 FR-13 — allow the TUN device node when kernel TUN is on.
-          DeviceAllow = lib.optional kernelTunActive "/dev/net/tun rw";
-
-          # SPEC-044 FR-10 — pre-flight cleanup of any stale interface.
-          ExecStartPre = execStartPre;
-
-          # Systemd hardening — mirrors deploy/airdress-operator.service.
-          DynamicUser           = true;
-          ProtectSystem         = "strict";
-          ProtectHome           = true;
-          NoNewPrivileges       = true;
-          PrivateTmp            = true;
-          ProtectKernelTunables = true;
-          ProtectControlGroups  = true;
-          RestrictSUIDSGID      = true;
-          StateDirectory        = "airdress-operator";
-          StateDirectoryMode    = "0750";
-
-          ReadWritePaths = secretsReadWritePaths;
-
-          # SPEC-035: deliver the 32-byte content key via systemd credential
-          # store so it never touches the Nix store or environment variables.
-          LoadCredentialEncrypted = loadCredentials;
-
-          # SPEC-038 FR-Enr1 — deliver the 72h bootstrap token via the
-          # systemd plaintext credential store (it's a one-time JWT, not a
-          # long-lived secret). Operator reads it from
-          # $CREDENTIALS_DIRECTORY/enrollment_token and deletes the source
-          # file (FR-Enr8) — caller is responsible for systemd-creds
-          # encryption if desired.
-          LoadCredential = loadPlaintextCredentials;
+    instances = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.submodule {
+        options = instanceOptions // {
+          enable = lib.mkEnableOption "this airdress-operator instance";
+          package = lib.mkOption {
+            type    = lib.types.package;
+            default = cfg.package;
+            defaultText = lib.literalExpression "services.airdress-operator.package";
+            description = "Operator package for this instance.";
+          };
         };
+      });
+      default = { };
+      example = lib.literalExpression ''
+        {
+          compute = {
+            enable = true;
+            role   = "compute";
+            homing = "https://ipv6-operator.alice.airdr.es";
+            compute.poolMemberName = "ai-nas-0-compute";
+            settings.bind              = "127.0.0.1:8080";
+            settings.database.data_dir = "/var/lib/airdress-operator-compute/postgres";
+          };
+          apps = {
+            enable = true;
+            settings.bind              = "127.0.0.1:8081";
+            settings.database.data_dir = "/var/lib/airdress-operator-apps/postgres";
+            settings.apps.backends.container.binary = "docker";
+          };
+        }
+      '';
+      description = ''
+        Named operator instances to run on this host, each with its own
+        systemd unit, DynamicUser, state directory and credential set.
+
+        One machine can be an inference pool member and a container host
+        at the same time. Those are different trust postures and belong
+        in different processes (RDR-035 §5.8) — a container-runtime grant
+        is root-equivalent; forwarding a request to a vLLM the user
+        already runs is not.
+
+        Instances are keyed by arbitrary names; the name becomes the unit
+        suffix. The instance named <literal>default</literal> keeps the
+        original unit and state-directory names and is what the
+        single-instance surface
+        (<option>services.airdress-operator.enable</option>) defines, so
+        an existing host sees no rename.
+
+        Instances share the host's RAM, CPU and GPU. This module asserts
+        that they do not collide on ports, PostgreSQL data directories,
+        healthz binds, pool member names or TUN interface names; it
+        cannot assert that they fit.
+      '';
+    };
+  };
+
+  config = lib.mkMerge [
+
+    # ── The single-instance surface, expressed as instances."default" ──
+    #
+    # Everything below operates on `instances`. The legacy options are a
+    # pure alias, so an existing host keeps its unit name, its state
+    # directory and therefore its PostgreSQL cluster.
+    (lib.mkIf cfg.enable {
+      services.airdress-operator.instances.default = {
+        enable = true;
+        inherit (cfg)
+          package postgresPackage postgresVersion
+          settings secretsFile logLevel contentKeyFile
+          role homing compute;
       };
+    })
+
+    {
+      assertions =
+        (lib.flatten (lib.mapAttrsToList (name: icfg:
+          let isCompute = icfg.role == "compute"; in [
+            {
+              assertion = !isCompute || icfg.homing != null;
+              message   = "services.airdress-operator.instances.${name}.homing must be set when role = \"compute\".";
+            }
+            {
+              assertion = !isCompute || icfg.compute.poolMemberName != "";
+              message   = "services.airdress-operator.instances.${name}.compute.poolMemberName must be set when role = \"compute\".";
+            }
+            {
+              # Linux caps interface names at IFNAMSIZ-1 = 15 bytes, and
+              # over-length fails at runtime with a confusing error rather
+              # than being rejected as configuration.
+              assertion = builtins.stringLength icfg.compute.tunName <= 15;
+              message   = "services.airdress-operator.instances.${name}.compute.tunName must be at most 15 bytes.";
+            }
+          ]) enabledInstances))
+        ++ [
+          (mkCollisionAssertion {
+            label  = "a bind address";
+            option = "settings.bind";
+            get    = settingsPath [ "bind" ];
+          })
+          (mkCollisionAssertion {
+            label  = "a PostgreSQL data directory";
+            option = "settings.database.data_dir";
+            get    = settingsPath [ "database" "data_dir" ];
+          })
+          (mkCollisionAssertion {
+            label  = "a compute healthz bind";
+            option = "compute.healthzBind";
+            get    = i: if i.role == "compute" then i.compute.healthzBind else null;
+          })
+          (mkCollisionAssertion {
+            label  = "a TUN interface name";
+            option = "compute.tunName";
+            get    = i:
+              if i.role == "compute" && i.compute.kernelTun
+              then i.compute.tunName else null;
+          })
+          (mkCollisionAssertion {
+            label  = "an inference pool member name";
+            option = "compute.poolMemberName";
+            get    = i: if i.role == "compute" then i.compute.poolMemberName else null;
+          })
+        ];
+
+      # Not an assertion: a single instance on the operator's default path
+      # is correct, and only becomes a hazard once there are two.
+      warnings = lib.optional
+        (lib.length (lib.attrNames enabledInstances) > 1
+          && lib.any (i: settingsPath [ "database" "data_dir" ] i == null)
+               (lib.attrValues enabledInstances))
+        ''
+          Two or more airdress-operator instances are enabled and at least
+          one does not set `settings.database.data_dir`. Each instance
+          embeds its own PostgreSQL; instances that fall back to the same
+          default path will fight over one cluster.
+        '';
+
+      systemd.services = lib.mapAttrs' (name: icfg:
+        let
+          unit            = unitNameFor name;
+          isCompute       = icfg.role == "compute";
+          kernelTunActive = isCompute && icfg.compute.kernelTun;
+          caps =
+            [ "CAP_NET_BIND_SERVICE" ]
+            ++ lib.optional kernelTunActive "CAP_NET_ADMIN";
+
+          # SPEC-044 FR-10 — clean up a stale TUN device left behind by a
+          # previous crashed instance before we try to create our own.
+          tunCleanupScript = pkgs.writeShellScript "${unit}-tun-cleanup" ''
+            set -eu
+            if ${pkgs.iproute2}/bin/ip link show ${icfg.compute.tunName} 2>/dev/null; then
+                ${pkgs.systemd}/bin/systemd-cat -t ${unit} \
+                    echo "kernel-tun: cleaning up stale ${icfg.compute.tunName}"
+                ${pkgs.iproute2}/bin/ip link delete ${icfg.compute.tunName} || true
+            fi
+          '';
+
+          secretsEnv = lib.optional (icfg.secretsFile != null)
+            "AIRDRESS_SECRETS_FILE=${icfg.secretsFile}";
+
+          secretsReadWritePaths = lib.optional (icfg.secretsFile != null)
+            (builtins.dirOf (toString icfg.secretsFile));
+        in
+        lib.nameValuePair unit {
+          description = "Airdress Operator${lib.optionalString (name != "default") " (${name})"}";
+          after       = [ "network-online.target" ];
+          wants       = [ "network-online.target" ];
+          wantedBy    = [ "multi-user.target" ];
+
+          serviceConfig = {
+            Type       = "simple";
+            ExecStart  = "${icfg.package}/bin/airdress-operator serve";
+            ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
+            Restart    = "on-failure";
+            RestartSec = "10s";
+            # initdb on first run can take a while; give it a generous budget.
+            TimeoutStartSec = "600";
+            TimeoutStopSec  = "30";
+
+            Environment = [
+              "AIRDRESS_CONFIG=${configFileFor name icfg}"
+              "AIRDRESS_LOG=${icfg.logLevel}"
+              # Point embedded-PG at the Nix store (exec-allowed) instead of the
+              # state directory (noexec under DynamicUser=yes).
+              "AIRDRESS_PG_INSTALLATION_DIR=${
+                mkPgInstallDir icfg.postgresPackage icfg.postgresVersion
+              }"
+            ] ++ secretsEnv;
+
+            # Allow binding privileged ports (DNS port 53) without root.
+            # SPEC-044: CAP_NET_ADMIN is added when role=compute + kernelTun=true.
+            AmbientCapabilities   = lib.concatStringsSep " " caps;
+            CapabilityBoundingSet = lib.concatStringsSep " " caps;
+
+            # SPEC-044 FR-13 — allow the TUN device node when kernel TUN is on.
+            DeviceAllow = lib.optional kernelTunActive "/dev/net/tun rw";
+
+            # SPEC-044 FR-10 — pre-flight cleanup of any stale interface.
+            ExecStartPre = lib.optional kernelTunActive (toString tunCleanupScript);
+
+            # Systemd hardening — mirrors deploy/airdress-operator.service.
+            # DynamicUser gives each instance its own uid, so one instance
+            # cannot read another's state directory or credentials. That is
+            # the isolation two processes buy over one process with both
+            # subsystems.
+            DynamicUser           = true;
+            ProtectSystem         = "strict";
+            ProtectHome           = true;
+            NoNewPrivileges       = true;
+            PrivateTmp            = true;
+            ProtectKernelTunables = true;
+            ProtectControlGroups  = true;
+            RestrictSUIDSGID      = true;
+            StateDirectory        = stateDirFor name;
+            StateDirectoryMode    = "0750";
+
+            ReadWritePaths = secretsReadWritePaths;
+
+            # SPEC-035: deliver the 32-byte content key via systemd credential
+            # store so it never touches the Nix store or environment variables.
+            LoadCredentialEncrypted = [ "content_key:${icfg.contentKeyFile}" ];
+
+            # SPEC-038 FR-Enr1 — deliver the 72h bootstrap token via the
+            # systemd plaintext credential store (it's a one-time JWT, not a
+            # long-lived secret). Operator reads it from
+            # $CREDENTIALS_DIRECTORY/enrollment_token and deletes the source
+            # file (FR-Enr8) — caller is responsible for systemd-creds
+            # encryption if desired.
+            LoadCredential =
+              lib.optional (isCompute && icfg.compute.bootstrapTokenFile != null)
+                "enrollment_token:${icfg.compute.bootstrapTokenFile}";
+          };
+        }) enabledInstances;
     }
-  );
+  ];
 }
