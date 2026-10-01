@@ -15,6 +15,7 @@ concurrency:
 jobs:
   pre-commit:
     name: Pre-commit (prek)
+    timeout-minutes: 30
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
