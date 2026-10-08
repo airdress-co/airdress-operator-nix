@@ -36,3 +36,5 @@ sops
 sqlx
 StateDirectory
 stdenv
+pyinfra
+serde
